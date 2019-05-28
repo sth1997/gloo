@@ -9,6 +9,7 @@ list(APPEND GLOO_SRCS
   "${CMAKE_CURRENT_SOURCE_DIR}/algorithm.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/allgather.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/allreduce.cc"
+  "${CMAKE_CURRENT_SOURCE_DIR}/allreduce_sparse.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/allreduce_local.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/barrier.cc"
   "${CMAKE_CURRENT_SOURCE_DIR}/broadcast.cc"

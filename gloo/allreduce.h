@@ -147,4 +147,6 @@ class AllreduceOptions {
 
 void allreduce(AllreduceOptions& opts);
 
+void allreduce_sparse(AllreduceOptions& opts);
+
 } // namespace gloo

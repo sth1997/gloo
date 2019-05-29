@@ -143,6 +143,7 @@ class AllreduceOptions {
   std::chrono::milliseconds timeout;
 
   friend void allreduce(AllreduceOptions&);
+  friend void allreduce_sparse(AllreduceOptions&);
 };
 
 void allreduce(AllreduceOptions& opts);

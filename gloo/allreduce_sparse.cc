@@ -32,7 +32,10 @@ static double compressTime = 0.0;
 static double decompressTime = 0.0;
 static double addSparseTime = 0.0;
 static double commTime = 0.0;
+static double selectTime = 0.0;
 #endif
+
+static bool useMultiThread = true;
 
 namespace gloo {
 
@@ -54,7 +57,7 @@ void to_sparse(float* const ptr, const size_t num, const size_t totalBytes)
  * Compress format: ((unsigned int) index, (datatype) val)
  * Example: (0,0,0,3,0,0,1,0,0,0,0,0,7,0,0) -> ((3,3),(6,1),(12,7))
  */
-void compress(const void* const src, void* const dst, size_t count, size_t nonzeroCount)
+void compress(const void* const src, void* const dst, const float topKVal, size_t count, size_t nonzeroCount)
 {
     #ifdef BREAKDOWN_ANALYSIS
     double start = get_wall_time();
@@ -63,21 +66,84 @@ void compress(const void* const src, void* const dst, size_t count, size_t nonze
     const float* const srcValue = (const float* const) src;
     CompressFormat* compressed = (CompressFormat*) dst;
     size_t compressNum = 0;
-    // TODO : use multi-thread
-    for (size_t index = 0; index < count; ++index)
-        if (srcValue[index] != 0.0f)
+    if(count < 512 * 1024 || !useMultiThread)
+    {
+        for (int index = 0; index < count; ++index)
+        if (srcValue[index] >= topKVal)
         {
             compressed[compressNum].index = (unsigned int) index;
             compressed[compressNum].value = srcValue[index];
             if (++compressNum == nonzeroCount)
                 break;
         }
-
+    }
+    else        
+    //chw multi-thread
+    {
+        int threadNum;
+        if(count < 32 * 1024 * 1024)
+            threadNum = 8;
+        else
+            threadNum = 16;
+        static unsigned int** compressIdx_thread;
+        compressIdx_thread = (unsigned int**)malloc(threadNum * sizeof(unsigned int*));
+        for(int i = 0; i < threadNum; ++i)
+            compressIdx_thread[i] = (unsigned int*)malloc(count / threadNum * sizeof(unsigned int));
+        int* threadIdx = (int*)malloc(threadNum * sizeof(int));
+        #pragma omp parallel num_threads(threadNum)
+        {
+            int rank = omp_get_thread_num() + 1;
+            int size = omp_get_num_threads();
+            int thread_index = 0;
+            int endIdx = rank * (count / size);
+            if (rank == size)
+                endIdx = count;
+            float compressKValLocal = topKVal;
+            unsigned int* compressIdxLocal = compressIdx_thread[rank - 1];
+            for(int i = (rank - 1) * (count /size); i < endIdx; ++i)
+            {
+                if(srcValue[i] >= compressKValLocal)
+                    compressIdxLocal[thread_index++] = i;
+            }  
+            threadIdx[rank - 1] = thread_index;
+        }
+        //merge
+        //int index = 0;
+        //int compressNum = 0;
+        for(int i = 0; i < threadNum; ++i)
+        {
+            unsigned int* compressIdx = compressIdx_thread[i];
+            for(int j = 0; j < threadIdx[i]; ++j)
+            {
+                compressed[compressNum].index = compressIdx[j];
+                compressed[compressNum].value = srcValue[compressIdx[j]];
+                if(++compressNum == nonzeroCount)
+                    break;
+            }
+            if(compressNum == nonzeroCount)
+                break;
+        }
+    }
     GLOO_ENFORCE_EQ(compressNum, nonzeroCount);
     #ifdef BREAKDOWN_ANALYSIS
     double end = get_wall_time();
     compressTime = end - start;
     #endif
+}
+
+void multi_thread_memset(void* dst, int val, size_t size)
+{
+    int my_rank = omp_get_thread_num();
+    int thread_count = omp_get_num_threads();
+    size_t size_per_thread = size / thread_count;
+    char* startAddr = ((char*) dst) + size_per_thread * my_rank;
+    if (my_rank != thread_count - 1)
+        memset(startAddr, val, size_per_thread);
+    else
+    {
+        size_t tmpSize = size - size_per_thread * my_rank;
+        memset(startAddr, val, tmpSize);
+    }
 }
 
 void decompress(const void* const src, void* const dst, size_t count, size_t nonzeroCount)
@@ -86,7 +152,23 @@ void decompress(const void* const src, void* const dst, size_t count, size_t non
     double start = get_wall_time();
     #endif
     
-    memset(dst, 0, sizeof(float) * nonzeroCount * 2);
+    // TODO : use multi-thread
+    if(count < 8 * 1024 * 1024 || !useMultiThread)
+        memset(dst, 0, sizeof(float) * count);
+    else	
+    {
+        int threadNum;
+        if(count < 32 * 1024 * 1024)
+            threadNum = 2;
+        else if(count < 128 * 1024 * 1024)
+            threadNum = 4;
+        else if(count <= 512 * 1024 * 1024)
+            threadNum = 8;
+        else
+            threadNum = 16;
+        #pragma omp parallel num_threads(threadNum)
+        multi_thread_memset(dst, 0, sizeof(float) * count);
+    }
 
     float* dstValue = (float*) dst;
     const CompressFormat* compressed = (CompressFormat*) src;
@@ -377,6 +459,110 @@ void allreduceSparse(const gloo::Slot& slot, const std::shared_ptr<Context> cont
 
 } // namespace
 
+float randomSelect(float* buf, int count, int k)
+{
+  std::nth_element(buf, buf + (count - k - 1), buf + count);
+  return buf[count - k - 1];
+}
+
+float select(const float* const buf, const int count)
+{
+    #ifdef BREAKDOWN_ANALYSIS
+    double start = get_wall_time();
+    #endif
+    // TODO : try to merge some sample buffers into one buffer
+    
+    // sample buf[0~sampleCount-1]
+    int sampleCount = count / 100;
+    static int times = 0;
+    ++times;
+    static float* tmpBuf;
+    static float** tmpbuf_thread;
+    if (times == 1)
+    {
+        // NOTE sampleCount * 10 * sizeof(float). The code "tmpBuf[index++]" may cause some error if we just alloc sampleCount*sizeof(float).
+        tmpBuf = (float*) mallocAlign(sampleCount * 10 * sizeof(float), 4);
+    }
+ 
+    float tmpKVal;
+    bool sampleFailed = true;
+    float ratio = 5.0f / 1000;
+    int index = 0;
+    while (sampleFailed)
+    {
+        memcpy(tmpBuf, buf, sampleCount * sizeof(float));
+        tmpKVal = randomSelect(tmpBuf, sampleCount, sampleCount * ratio - 1);
+        if(count <= 4 * 1024 * 1024 || !useMultiThread)
+        {
+          for (int i = 0; i < count; ++i)
+            // do NOT set a[i]=0 if a[i] < tmpKVal
+            if (buf[i] >= tmpKVal)
+                tmpBuf[index++] = buf[i];
+        }
+        else		
+        {
+            int thread_count;
+            if(count <= 32 * 1024 * 1024)
+                thread_count = 4;
+            else if(count <= 128 * 1024 * 1024)
+                thread_count = 8;
+            else
+                thread_count = 16;
+            tmpbuf_thread = (float**)malloc(thread_count * sizeof(float*));
+            for(int i = 0; i < thread_count; ++i)
+                tmpbuf_thread[i] = (float*)malloc(count / thread_count * sizeof(float));
+            int* threadIdx = (int*) malloc(thread_count * sizeof(int));
+            double start2 = get_wall_time();
+            #pragma omp parallel num_threads(thread_count)
+            {
+                int rank = omp_get_thread_num() + 1;
+                int size = omp_get_num_threads();
+                int thread_index = 0;
+                int endIdx = rank * (count / size);
+                if (rank == size)
+                    endIdx = count;
+                float tmpKValLocal = tmpKVal;
+                float* tmpBufLocal = tmpbuf_thread[rank - 1];
+                for(int i = (rank - 1) * (count / size); i < endIdx; ++i)
+                {
+                    if(buf[i] >= tmpKValLocal)
+                        tmpBufLocal[thread_index++] = buf[i];
+                    //tmpbuf_thread[rank - 1][thread_index++] = buf[i];
+                }
+                // avoid false sharing
+                threadIdx[rank - 1] = thread_index;
+            }
+            printf("parallelTime = %.5f\n", get_wall_time() - start2);
+            //merge
+            for(int i = 0; i < thread_count; ++i)
+            {
+                //for(int j = 0; tmpbuf_thread[i][j] != 0 && j < count / thread_count; j++)
+                //    tmpBuf[index++] = tmpbuf_thread[i][j];
+                memcpy(tmpBuf + index, tmpbuf_thread[i], threadIdx[i] * sizeof(float));
+                index += threadIdx[i];
+            }
+            free(threadIdx);
+        }
+        printf("tmpKval = %.5f index = %d  count = %d\n", tmpKVal, index, count);
+        if (index > sampleCount * 10)
+        {
+            printf("Index is too large! May cause buffer overflow error!");
+            std::abort();
+        }
+        if (index < count / 1000)
+        {
+            sampleFailed = true;
+            ratio *= 2.0f;
+            continue;
+        }
+        float ret =  randomSelect(tmpBuf, index, count / 1000 - 1);
+        #ifdef BREAKDOWN_ANALYSIS
+        selectTime = get_wall_time() - start;
+        #endif
+        return ret;
+    }
+}
+
 
 //Now, only support FLOAT and OP_SUM
 void allreduce_sparse(AllreduceOptions& opts) {
@@ -412,12 +598,13 @@ void allreduce_sparse(AllreduceOptions& opts) {
   decompressTime = 0.0;
   addSparseTime = 0.0;
   commTime = 0.0;
+  selectTime = 0.0;
   #endif
 
   // TODO : allocate a large buffer in progressGroupGloo to use everytime
   // TODO : select top-k
   size_t count = opts.elements;
-  to_sparse((float* const) out[0]->ptr, count, totalBytes);
+  float topKVal = select((float*) out[0]->ptr, count);
   size_t nonzeroCount = opts.elements / 1000;
 
   int rank = context->rank;
@@ -433,7 +620,7 @@ void allreduce_sparse(AllreduceOptions& opts) {
       context->createUnboundBuffer(tmpAllocation2.get(), (sizeof(int) + sizeof(float)) * nonzeroCount * size);
   transport::UnboundBuffer* inplacebuf_free = tmpBuffer1.get();
   transport::UnboundBuffer* tmp_buf = tmpBuffer2.get();
-  compress(out[0]->ptr, inplacebuf_free->ptr, count, nonzeroCount);
+  compress(out[0]->ptr, inplacebuf_free->ptr, topKVal, count, nonzeroCount);
   
   size_t totalNonzeroCount;
   transport::UnboundBuffer* resultBuf;
@@ -441,6 +628,7 @@ void allreduce_sparse(AllreduceOptions& opts) {
   decompress(resultBuf->ptr, out[0]->ptr, count, totalNonzeroCount);
 
   #ifdef BREAKDOWN_ANALYSIS
+  printf("selectTime = %.5f\n", selectTime);
   printf("compressTime = %.5f\n", compressTime);
   printf("decompressTime = %.5f\n", decompressTime);
   printf("addSparseTime = %.5f\n", addSparseTime);
